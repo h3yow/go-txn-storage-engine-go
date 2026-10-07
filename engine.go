@@ -20,6 +20,26 @@ type DB struct {
 	commitMu sync.RWMutex
 	version  uint64 // 当前最新已提交版本（单调递增）
 
+	// 保留范围与增量回收相关状态。
+	// historyFloor 是可打开历史视图的最低版本：来自最近一次完成的检查点。
+	// gcSession 非空表示有一个跨多轮写入的分片检查点正在进行。
+	// gcPrevFloor 是上一个已完成检查点的版本号，用于逐段判定回收：
+	// 只删除“不含检查点分片、且段内最大提交版本 <= gcPrevFloor”的段。
+	// 0 表示当前完成的是第一个检查点，本轮不删含数据段。
+	retMu        sync.RWMutex
+	historyFloor uint64
+	gcSession    *gcSession
+	gcPrevFloor  uint64
+	gcRunning    sync.Mutex // 串行化所有（显式/自动）回收执行
+	gcWake       chan struct{}
+	autoStop     chan struct{}
+	autoDone     chan struct{}
+
+	// crashHook 仅用于测试：在回收的特定阶段被调用，钩子返回的退出码
+	// 通过 os.Exit 模拟“回收到一半进程被强杀”（不运行 defer、不 fsync 收尾）。
+	// phase 取值：见 retention.go 中的 crashPhase* 常量。
+	crashHook func(phase string)
+
 	// liveTxns 记录当前所有活跃事务的快照版本，GC 据此确定不能越过的边界。
 	liveMu    sync.Mutex
 	liveTxns  map[uint64]*Txn
@@ -50,16 +70,23 @@ func Open(dir string, opts Options) (*DB, error) {
 		store:    newMVCCStore(),
 		liveTxns: make(map[uint64]*Txn),
 		recovery: wstats,
+		gcWake:   make(chan struct{}, 1),
 	}
 
-	// 回放日志：若有检查点，从检查点全量态开始，只应用检查点之后的提交。
-	commits, cp, rstats, err := wlog.readAllRecords()
+	// 回放日志：若有检查点（整段式或分片式，取版本最高者），
+	// 从检查点全量态开始，只应用检查点之后的提交。
+	commits, cp, chunkCP, rstats, err := wlog.readAllRecords()
 	if err != nil {
 		return nil, err
 	}
-	if cp != nil {
-		db.store.restoreFromCheckpoint(cp.version, cp.state)
-		db.version = cp.version
+	bestCP := cp
+	if chunkCP != nil && (bestCP == nil || chunkCP.version > bestCP.version) {
+		bestCP = chunkCP
+	}
+	if bestCP != nil {
+		db.store.restoreFromCheckpoint(bestCP.version, bestCP.state)
+		db.version = bestCP.version
+		db.historyFloor = bestCP.version
 	}
 	cpVer := db.version
 	for _, rec := range commits {
@@ -79,6 +106,39 @@ func Open(dir string, opts Options) (*DB, error) {
 	db.recovery.CheckpointFound = rstats.CheckpointFound
 	db.recovery.CheckpointVer = rstats.CheckpointVer
 
+	// 初始保留边界：检查点版本即“可回看历史的最低版本”；
+	// 若最高检查点处于“待最终化”中间态，下面会把边界回退到它之前。
+	if bestCP != nil {
+		db.historyFloor = bestCP.version
+	}
+
+	// 崩溃窗口恢复：回收删除采用“逐段内容判定”（见 deleteReclaimableSegments），
+	// 天然幂等——重启后无法、也不需要精确区分“删段是否完成”，只需把版本最高
+	// 的已完成分片检查点 S 恢复为：
+	//
+	//	historyFloor = S.version（保留边界随已落盘的末片立即生效，
+	//	                             因为打开 S 视图所需的检查点分片都在）；
+	//	gcPrevFloor  = 上一个完成检查点版本（没有则 0）；
+	//
+	// 若 S 末片之后崩溃、部分旧段尚未删除，它们在重启后第一次 GC 时会按
+	// 同样的内容规则被幂等补删，删除结果与崩溃前应有的结果一致。
+	// 写到一半（无 final）的会话不参与，其分片只占空间，不影响正确性。
+	finSessions, ferr := wlog.finishedChunkSessions()
+	if ferr != nil {
+		return nil, ferr
+	}
+	if len(finSessions) > 0 {
+		latest := finSessions[len(finSessions)-1]
+		db.historyFloor = latest.version
+		if len(finSessions) >= 2 {
+			db.gcPrevFloor = finSessions[len(finSessions)-2].version
+		}
+	}
+
+	if db.opts.EnableAutoGC && db.opts.RetainVersions > 0 {
+		db.startAutoGC()
+	}
+
 	return db, nil
 }
 
@@ -91,6 +151,7 @@ func (db *DB) Close() error {
 	}
 	db.closed = true
 	db.closedMu.Unlock()
+	db.stopAutoGC()
 	return db.wlog.close()
 }
 
@@ -123,15 +184,20 @@ func (db *DB) beginTxn(readOnly bool) (*Txn, error) {
 	db.commitMu.RUnlock()
 
 	db.liveMu.Lock()
-	db.nextTxnID++
-	t := &Txn{
-		db:       db,
-		id:       db.nextTxnID,
-		readOnly: readOnly,
-		snapshot: snap,
-		staged:   make(map[string]*writeEntry),
+	var t *Txn
+	if readOnly {
+		t = db.newReadOnlyTxnLocked(snap)
+	} else {
+		db.nextTxnID++
+		t = &Txn{
+			db:       db,
+			id:       db.nextTxnID,
+			readOnly: false,
+			snapshot: snap,
+			staged:   make(map[string]*writeEntry),
+		}
+		db.liveTxns[t.id] = t
 	}
-	db.liveTxns[t.id] = t
 	db.liveMu.Unlock()
 	return t, nil
 }
@@ -145,6 +211,7 @@ func (db *DB) finishTxn(t *Txn) {
 	db.liveMu.Lock()
 	delete(db.liveTxns, t.id)
 	db.liveMu.Unlock()
+	db.signalAutoGC() // 老读者离开后，回收可能可以继续推进
 }
 
 // commitTxn 是提交的唯一入口，串行执行，保证冲突判定 + 落盘 + 发布的原子性顺序。
@@ -192,6 +259,7 @@ func (db *DB) commitTxn(t *Txn) error {
 	db.store.applyAt(newVersion, writes)
 	db.version = newVersion
 	db.finishTxn(t)
+	db.signalAutoGC()
 	return nil
 }
 
@@ -209,16 +277,35 @@ func (db *DB) oldestActiveSnapshot() uint64 {
 	return oldest
 }
 
-// GCOptions 控制一次显式回收（当前为保留字段，便于将来扩展阈值/触发策略）。
-type GCOptions struct{}
+// GCOptions 控制一次显式回收。零值字段表示沿用 Options 的配置。
+type GCOptions struct {
+	// MaxKeys/MaxBytes 覆盖本次调用的单轮工作量上限；0 表示用 Options 默认。
+	MaxKeys  int
+	MaxBytes int
+
+	// MaxRounds 限制本次调用最多推进多少个有界小轮；0 表示推进到
+	// 本轮无法继续为止（被保留边界/老读者卡住或已追平目标）。
+	MaxRounds int
+}
 
 // GCResult 汇报回收结果。
 type GCResult struct {
-	Blocked          bool   // 是否因活跃旧快照而未执行回收
+	Blocked          bool   // 是否因活跃旧快照而未执行回收（旧模式）
 	OldestSnapshot   uint64 // 阻塞边界（Blocked 时有效）
 	CheckpointVer    uint64 // 本次写入检查点的版本
 	CheckpointSegSeq int    // 检查点所在新段序号
 	SegmentsRemoved  int    // 删除的旧段数量
+
+	// 增量回收模式（RetainVersions>0）的额外汇报。
+	Incremental     bool   // 是否走了保留范围增量回收路径
+	Rounds          int    // 本次实际推进的小轮数
+	ChunksWritten   int    // 本次写入的检查点分片数
+	KeysWritten     int    // 本次写入分片的键数
+	Completed       bool   // 是否有一个检查点在本次调用中完成并推进了保留边界
+	BlockedByReader bool   // 是否因活跃老读者暂时停在当前位置（可稍后自动继续）
+	HistoryFloor    uint64 // 调用结束后当前保留边界
+	RetainTarget    uint64 // 调用结束后保留策略理论目标
+	EffectiveTarget uint64 // 综合老读者后的实际目标
 }
 
 // GarbageCollect 在不影响任何活跃读事务的前提下回收日志：
@@ -232,6 +319,11 @@ type GCResult struct {
 func (db *DB) GarbageCollect(gc GCOptions) (GCResult, error) {
 	if err := db.checkOpen(); err != nil {
 		return GCResult{}, err
+	}
+
+	// 启用保留范围策略时走增量、有界的在线回收；默认路径行为完全不变。
+	if db.opts.RetainVersions > 0 {
+		return db.garbageCollectIncremental(gc)
 	}
 
 	db.commitMu.RLock()

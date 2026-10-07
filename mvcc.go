@@ -1,6 +1,9 @@
 package storage
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 // versionedValue 是一个键的某个历史版本。
 type versionedValue struct {
@@ -145,4 +148,28 @@ func (m *mvccStore) keyCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.keys)
+}
+
+// visibleKeysAt 返回在版本 snap 下“存在”（最新可见版本不是墓碑）的全部键，
+// 按字典序排列。用于增量检查点开始时固定一份键清单：
+// 清单一旦确定就不再变化（map 只增不删键，且每个键的版本链只追加），
+// 后续分片即使与新提交并发进行，也只按清单逐键取 snap 时刻的值。
+func (m *mvccStore) visibleKeysAt(snap uint64) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	keys := make([]string, 0, len(m.keys))
+	for key, chain := range m.keys {
+		for i := len(chain) - 1; i >= 0; i-- {
+			v := chain[i]
+			if v.version <= snap {
+				if !v.deleted {
+					keys = append(keys, key)
+				}
+				break
+			}
+		}
+	}
+	sort.Strings(keys)
+	return keys
 }

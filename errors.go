@@ -36,6 +36,15 @@ var (
 
 	// ErrNotFound 表示在事务快照中该键不存在（已删除或从未写入）。
 	ErrNotFound = errors.New("storage: key not found")
+
+	// ErrHistoryNotAvailable 表示请求的历史提交点已经落在保留范围之外
+	// （回收已越过它）或该提交点尚不存在。与 ErrNotFound（键不存在）
+	// 和 ErrTxnNotActive（事务失效）明确区分，调用方用 errors.Is 即可判定。
+	ErrHistoryNotAvailable = errors.New("storage: requested history version is outside the retention window")
+
+	// ErrInvalidVersion 表示请求的历史版本号本身非法（0、超过当前版本）。
+	// 语义上属于“版本不可用”，errors.Is(err, ErrHistoryNotAvailable) 也成立。
+	ErrInvalidVersion = errors.New("storage: invalid history version")
 )
 
 // ConflictError 携带写写冲突的细节，errors.Is(err, ErrWriteWriteConflict) 仍然成立。
@@ -82,6 +91,27 @@ func (e *GCBlockedError) Error() string {
 
 // Is 让 GCBlockedError 可被 errors.Is(..., ErrGCBlocked) 命中。
 func (e *GCBlockedError) Is(target error) bool { return target == ErrGCBlocked }
+
+// HistoryError 携带历史视图请求失败的边界细节。
+// Kind 指向 ErrInvalidVersion 或 ErrHistoryNotAvailable；
+// 任一情况 errors.Is(err, ErrHistoryNotAvailable) 都成立，
+// 方便调用方只关心“这个历史点还能不能开”。
+type HistoryError struct {
+	Kind    error  // ErrInvalidVersion / ErrHistoryNotAvailable
+	Version uint64 // 请求的版本
+	Floor   uint64 // 当前保留边界（可开视图的最低版本）
+	Current uint64 // 当前最新提交版本
+}
+
+func (e *HistoryError) Error() string {
+	return "storage: history view at version " + uitoa(e.Version) +
+		" unavailable (floor=" + uitoa(e.Floor) + ", current=" + uitoa(e.Current) + ")"
+}
+
+// Is 让 HistoryError 同时可被 ErrHistoryNotAvailable 与其具体 Kind 命中。
+func (e *HistoryError) Is(target error) bool {
+	return target == ErrHistoryNotAvailable || target == e.Kind
+}
 
 func uitoa(u uint64) string {
 	if u == 0 {
