@@ -79,6 +79,12 @@ type wal struct {
 	seq    int      // 当前活动段序号
 	f      *os.File // 当前活动段文件
 	offset int64    // 当前段已写入字节
+
+	// segMax 记录每个段中最大的提交记录版本号（不含检查点）。
+	// 增量回收据此判断“某段的提交是否全部 <= 回收水位”，
+	// 只有全部 <= 水位的非活动段才能被安全删除。
+	// 恢复时由 readAllRecords 重建；运行时在提交追加/滚动时维护。
+	segMax map[int]uint64
 }
 
 func walName(seq int) string {
@@ -144,7 +150,7 @@ func openWAL(dir string, opts Options) (*wal, recoveryStats, error) {
 		_ = syncDir(dir)
 	}
 
-	return &wal{dir: dir, opts: opts, seq: seq, f: f, offset: fi.Size()}, stats, nil
+	return &wal{dir: dir, opts: opts, seq: seq, f: f, offset: fi.Size(), segMax: make(map[int]uint64)}, stats, nil
 }
 
 // inspectSegment 顺序解析一个段的所有帧，
@@ -192,6 +198,7 @@ func (w *wal) readAllRecords() (commits []commitRec, cp *checkpointRec, stats re
 	}
 	stats.SegmentsScanned = len(names)
 	for _, name := range names {
+		segSeq := parseWalSeq(name)
 		data, rerr := os.ReadFile(filepath.Join(w.dir, name))
 		if rerr != nil {
 			return nil, nil, stats, rerr
@@ -214,6 +221,10 @@ func (w *wal) readAllRecords() (commits []commitRec, cp *checkpointRec, stats re
 				}
 				commits = append(commits, rec)
 				stats.CommitRecords++
+				// 重建段级最大提交版本，供增量回收判定可删段。
+				if rec.version > w.segMax[segSeq] {
+					w.segMax[segSeq] = rec.version
+				}
 			case recTypeCheckpoint:
 				c, cerr := decodeCheckpoint(payload)
 				if cerr != nil {
@@ -247,6 +258,19 @@ func readFrame(buf []byte) (payload []byte, frameLen int, ok bool) {
 		return nil, 0, false
 	}
 	return buf[walHdrSize : walHdrSize+payloadLen], frameLen, true
+}
+
+// appendCommit 追加一条提交记录并维护段级最大提交版本。
+func (w *wal) appendCommit(rec commitRec, sync bool) error {
+	if err := w.appendPayload(encodeCommit(rec), sync); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	if rec.version > w.segMax[w.seq] {
+		w.segMax[w.seq] = rec.version
+	}
+	w.mu.Unlock()
+	return nil
 }
 
 // appendPayload 编码一帧并追加到日志，必要时滚动新段；提交成功语义要求 sync。
@@ -308,14 +332,60 @@ func (w *wal) deleteSegmentsBefore(seq int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	removed := 0
+	var seqs []int
 	for _, name := range names {
-		if parseWalSeq(name) < seq {
-			if err := os.Remove(filepath.Join(w.dir, name)); err != nil {
-				return removed, fmt.Errorf("storage: remove segment %s: %w", name, err)
-			}
-			removed++
+		if s := parseWalSeq(name); s < seq {
+			seqs = append(seqs, s)
 		}
+	}
+	return w.deleteSegmentsBySeq(seqs)
+}
+
+// deletableSegments 列出所有“提交记录全部 <= horizon”的非活动段序号。
+// 活动段永远不在候选内（后续提交还要写入它）。
+// 调用前提：horizon 对应的检查点已经持久化到一个更新的段中，
+// 因此被列出的段删除后，恢复仍可从事故点 + 更新段重建全部已提交状态。
+func (w *wal) deletableSegments(horizon uint64) ([]int, error) {
+	w.mu.Lock()
+	active := w.seq
+	w.mu.Unlock()
+
+	names, err := listWalSegments(w.dir)
+	if err != nil {
+		return nil, err
+	}
+	var seqs []int
+	for _, name := range names {
+		s := parseWalSeq(name)
+		if s == active {
+			continue
+		}
+		w.mu.Lock()
+		maxVer := w.segMax[s]
+		w.mu.Unlock()
+		if maxVer <= horizon {
+			seqs = append(seqs, s)
+		}
+	}
+	return seqs, nil
+}
+
+// deleteSegmentsBySeq 删除指定序号的段文件；幂等（不存在的段跳过）。
+func (w *wal) deleteSegmentsBySeq(seqs []int) (int, error) {
+	removed := 0
+	for _, s := range seqs {
+		path := filepath.Join(w.dir, walName(s))
+		err := os.Remove(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // 崩溃重入：上一轮已删掉，跳过
+			}
+			return removed, fmt.Errorf("storage: remove segment %s: %w", walName(s), err)
+		}
+		removed++
+		w.mu.Lock()
+		delete(w.segMax, s)
+		w.mu.Unlock()
 	}
 	if removed > 0 {
 		if err := syncDir(w.dir); err != nil {

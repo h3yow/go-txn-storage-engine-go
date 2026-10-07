@@ -5,7 +5,7 @@
 
 1. 读写事务与快照隔离；
 2. 基于追加日志（WAL）的持久化与崩溃恢复；
-3. 日志回收时对仍在读旧快照的事务所做的边界保护。
+3. 按历史提交点回看 + 保留范围内的在线增量日志回收。
 
 包名为 `storage`，引入路径：`github.com/h3yow/go-txn-storage-engine-go`。
 
@@ -38,6 +38,18 @@ if err := tx.Commit(); err != nil {
 // 只读事务：持有一致快照，同时参与 GC 的安全边界计算
 ro, _ := db.BeginReadOnly()
 defer ro.Rollback()
+
+// 历史视图：从某个历史提交点回看（只读）
+view, err := db.BeginReadOnlyAt(7) // 钉在提交版本 v7
+if errors.Is(err, storage.ErrSnapshotExpired) {
+    // v7 已出保留范围，被回收了
+}
+v, _ := view.Get("user:1") // v7 那一刻的已提交状态
+view.Rollback()            // 释放后回收才能越过 v7
+
+// 省事说法：回看最近第 3 次提交
+view2, _ := db.BeginReadOnlyLastN(3)
+view2.Rollback()
 ```
 
 ---
@@ -70,12 +82,16 @@ defer ro.Rollback()
 | `ErrKeyTooLarge` | 单键字节数超过 `MaxKeyBytes` |
 | `ErrValueTooLarge` | 单值字节数超过 `MaxValueBytes` |
 | `ErrTxnTooLarge` | 单事务累计写入字节数超过 `MaxTxnWriteBytes` |
-| `ErrGCBlocked` | 回收被持有旧快照的活跃读事务阻塞 |
+| `ErrGCBlocked` | 整体式回收（`GarbageCollect`）被持有旧快照的活跃读事务阻塞 |
+| `ErrSnapshotExpired` | 请求的历史提交点已出保留范围（历史已被回收或从未存在） |
+| `ErrSnapshotInFuture` | 请求的历史提交点比最新已提交版本还新 |
 | `ErrLogCorrupted` | 日志在**非尾部**位置损坏 |
 | `ErrNotFound` | 快照视图下键不存在（含已删除） |
 | `ErrClosed` | 引擎已关闭 |
 
-`*LimitError` 还携带 `Size` / `Limit` 实际数值；`*GCBlockedError` 携带最老快照与拟回收版本。
+`*LimitError` 还携带 `Size` / `Limit` 实际数值；`*GCBlockedError` 携带最老快照与拟回收版本；
+`*SnapshotError` 携带请求版本、当前历史边界与最新版本。
+“历史已过期 / 键不存在 / 事务已失效”三类原因两两可用 `errors.Is` 稳定区分。
 
 ---
 
@@ -138,7 +154,7 @@ CRC32 覆盖 `magic || payloadLen || payload`。payload 的第一个字节区分
 
 ### 触发方式
 
-回收是**显式触发**的：调用 `db.GarbageCollect(storage.GCOptions{})`。
+整体式回收是**显式触发**的：调用 `db.GarbageCollect(storage.GCOptions{})`。
 （段文件还会在单段大小超过 `MaxWalSegmentBytes` 时自动滚动，但滚动本身不删除旧段。）
 
 一次回收做三件事：
@@ -165,7 +181,78 @@ GC 前计算当前所有活跃事务中**最老的快照版本** `oldest`：
 
 ---
 
-## 5. 边界配置（`Options`）
+## 5. 历史视图与保留范围内的在线增量回收
+
+在整体式 GC 之外，引擎提供一套**按历史提交点回看 + 有界增量回收**的能力，
+让老读者不再把回收整体卡住。默认不启用（`RetainVersions=0`），行为与旧版完全一致。
+
+### 历史视图语义
+
+- `db.BeginReadOnlyAt(version)`：从指定提交版本开启只读视图。
+  视图读到那一刻**已提交的完整状态**；之后任何提交、删除都不影响它；
+  在该提交点之前被删除的键表现为 `ErrNotFound`。
+- `db.BeginReadOnlyLastN(n)`：省事说法，“回看最近第 N 次提交”。
+  `n=1` 即最新已提交版本；`n=0` 返回 `ErrSnapshotInFuture`。
+- 视图用 `Rollback()` 结束。视图活跃期间被计入回收保护边界：
+  **它依赖的历史不会被回收**（回收水位被最老活跃视图钳制，而不是拒绝回收）。
+- 可回看的版本区间是 `[历史边界, 最新版本]`，落在区间外分别返回
+  `ErrSnapshotExpired` / `ErrSnapshotInFuture`（`*SnapshotError` 携带边界细节）。
+
+### 保留范围策略
+
+`Options.RetainVersions = N` 表示“保留最近 N 个提交版本可回看”。
+启用后（N>0）：
+
+- 引擎启动**后台增量回收循环**：提交超出窗口、或读者/视图退出时自动唤醒推进；
+- 也可以随时调用 `db.ReclaimLog()` 手动同步执行一轮（未启用保留策略时同样可用，
+  此时目标水位为当前最新版本）。
+
+### 增量回收的推进规则
+
+每一轮回收做且只做一小步：
+
+1. 目标水位 = 保留窗口允许回收到的版本（`当前版本 - N + 1`）；
+2. 水位先被**最老活跃读者/视图快照**钳制——能安全收的先收，收不动的留着，
+   读者结束后后台循环自动继续推进，不会卡住不动；
+3. 再被 `ReclaimMaxVersionsPerRound` 钳制（单轮最多推进多少个版本）；
+4. 把水位的全量态检查点写入一个**全新段**并 fsync，然后删除
+   “提交记录全部 ≤ 水位”的非活动旧段；检查点字节数超过
+   `ReclaimMaxCheckpointBytes` 时本轮跳过（单轮额外磁盘占用上限）。
+
+单轮工作量与额外磁盘占用都有可配置上限，且每轮之间释放提交锁，
+因此回收不会长时间独占提交路径，写入延迟不会出现明显尖峰。
+
+### 崩溃安全与进度接续
+
+- 检查点**先持久化、后删段**：回收到一半被强杀时，重启回放按版本号跳过
+  ≤ 检查点的重复记录，已返回成功的提交一条不少；
+- 历史边界（回收进度）就是检查点版本本身，重启后自动接续，不会回退；
+- 删段动作幂等：重启后重跑回收不会把结果搞乱。
+
+### 查询保留边界与回收进度
+
+```go
+info := db.RetentionInfo()
+// info.CurrentVersion  最新已提交版本
+// info.HistoryFloor    可回看的最早提交版本（历史边界）
+// info.OldestReader    当前最老活跃读者快照（0 表示无）
+// info.PendingReclaim  窗口之外仍有历史待回收
+```
+
+`db.ReclaimLog()` 返回的 `ReclaimResult` 携带本轮水位、边界推进、
+删段数、检查点字节数、是否被读者钳制（`BlockedByReader`）与是否待续（`Pending`）。
+
+### 与已有用法、已有数据目录的兼容
+
+- `RetainVersions` 默认为 0：不启动后台回收、不做任何增量回收，
+  `GarbageCollect` 等原有 API 行为完全不变；
+- 已有数据目录无需迁移：无检查点的目录历史边界为 0（全部历史可回看）；
+  曾被整体式 GC 处理过的目录，历史边界从已有检查点版本接续；
+- 磁盘记录格式未变（复用既有的 COMMIT / CHECKPOINT 记录），新旧版本可互开目录。
+
+---
+
+## 6. 边界配置（`Options`）
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -174,13 +261,15 @@ GC 前计算当前所有活跃事务中**最老的快照版本** `oldest`：
 | `MaxTxnWriteBytes` | 16 MiB | 单事务累计写入上限，超出返回 `ErrTxnTooLarge` |
 | `MaxWalSegmentBytes` | 4 MiB | 单 WAL 段大小，达到后追加写入自动滚动新段 |
 | `SyncOnCommit` | `true` | 每次提交是否 fsync；崩溃恢复语义要求保持开启 |
+| `RetainVersions` | 0（不启用） | 保留最近 N 个提交版本可回看；>0 时启动后台增量回收 |
+| `ReclaimMaxVersionsPerRound` | 128 | 单轮回收水位最多推进多少个版本（0=默认） |
+| `ReclaimMaxCheckpointBytes` | 64 MiB | 单轮回收检查点字节数上限，即单轮额外磁盘占用上限（0=默认） |
 
-所有上限必须为正数，否则 `Open` 直接失败。
+前四项上限必须为正数，否则 `Open` 直接失败；回收两项上限为 0 表示取默认值。
 
 ---
 
-## 6. 本地运行与验证
-
+## 7. 本地运行与验证
 要求 Go 1.25+（见 `go.mod`）。
 
 ```bash
@@ -210,16 +299,31 @@ go test -count=20 ./...
 | `TestRecoverTornTailCRCMismatch` | `recovery_test.go` | 长度完整但 CRC 被写坏的尾帧同样被截断跳过 |
 | `TestCorruptionMidLogRejected` | `recovery_test.go` | 段中段损坏（坏帧后仍有有效段）时返回 `ErrLogCorrupted`，引擎拒绝启动 |
 | `TestBoundaryRejections` | `limits_test.go` | 键/值/事务三类超限分别返回不同错误且携带实际尺寸，互不混淆 |
+| `TestHistoricalViewAtCommitPoint` | `history_test.go` | 按提交点开历史视图：视图固定那一刻的已提交状态，之后的提交/删除不可见，已删键表现为不存在 |
+| `TestBeginReadOnlyLastN` | `history_test.go` | “回看最近第 N 次提交”的换算与 n=0/超限的边界错误 |
+| `TestSnapshotExpiredDistinctErrors` | `history_test.go` | 历史过期 / 键不存在 / 事务失效三类原因用 `errors.Is` 两两区分 |
+| `TestMultipleHistoricalViewsConcurrently` | `history_test.go` | 多个历史视图同时存活：并发读各自一致；回收被最老视图钳制并随视图释放逐段推进 |
+| `TestReclaimRetentionBoundary` | `reclaim_test.go` | 保留窗口边界：窗口外过期、窗口内可看；重启后边界与数据接续 |
+| `TestReclaimRoundBounds` | `reclaim_test.go` | 单轮推进版本数不超过 `ReclaimMaxVersionsPerRound` |
+| `TestReclaimAutoResumesAfterReader` | `reclaim_test.go` | 后台回收被老读者钳制在某个点，读者结束后自动继续推进到窗口下沿 |
+| `TestReclaimConcurrentWithCommits` | `reclaim_test.go` | 提交/回收/开视图三方并发（race 检测），已提交键一条不丢 |
+| `TestReclaimCrashRecoveryLoop` | `reclaim_test.go` | 子进程并发提交+回收并反复 SIGKILL：已确认提交不丢、历史边界不回退、回收重来幂等 |
 
 测试用 `-v` 运行时会打印关键输入（初始版本、暂存值、残帧字节数、
-最老快照版本等）与判定依据（赢家版本、截断位置、删除段数），
+最老快照版本、提交点、保留窗口、回收水位、提交结果等）与判定依据
+（赢家版本、截断位置、删除段数、边界推进），
 并在恢复测试里显式输出“崩溃前 / 重启恢复后”的数据快照做对比。
 
 ---
 
-## 7. 设计取舍与边界
+## 8. 设计取舍与边界
 
 - 数据在内存中保留完整多版本链，重启由 WAL/检查点重建；本实现面向“把状态与恢复语义讲清楚”，没有做块式索引或后台压缩。
 - 提交点串行化（一把提交锁）换取了冲突检测与发布顺序的简单可靠；读路径无阻塞。
-- GC 采用保守安全策略：只要存在快照早于检查点版本的活跃事务就整体不回收，
+- 整体式 GC（`GarbageCollect`）采用保守安全策略：只要存在快照早于检查点版本的活跃事务就整体不回收，
   宁可少回收，也不删掉任何仍可能被读到的记录。
+- 增量回收（`ReclaimLog` / 后台循环）则反过来追求“能收先收”：水位被最老读者钳制而非整体拒绝，
+  单轮工作量与磁盘占用有上限，换得老读者不再卡住日志空间；代价是每轮要写一份水位全量态检查点，
+  且段内版本混杂时（一段里既有 ≤ 水位又有 > 水位的提交）该段要等后续轮次才能回收。
+- 历史视图依赖内存版本链 + 磁盘检查点共同保证：进程内视图由活跃事务集合保护，
+  重启后可回看的范围以持久化的历史边界（检查点版本）为准。

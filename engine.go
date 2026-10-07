@@ -20,6 +20,11 @@ type DB struct {
 	commitMu sync.RWMutex
 	version  uint64 // 当前最新已提交版本（单调递增）
 
+	// historyFloor 是当前可回看的最早提交版本（历史边界）：
+	// 等于最近一次回收写入的检查点版本；从未回收过时为 0（全部历史可看）。
+	// 由 commitMu 保护；增量回收推进它，重启后从检查点恢复。
+	historyFloor uint64
+
 	// liveTxns 记录当前所有活跃事务的快照版本，GC 据此确定不能越过的边界。
 	liveMu    sync.Mutex
 	liveTxns  map[uint64]*Txn
@@ -27,6 +32,12 @@ type DB struct {
 
 	closedMu sync.RWMutex
 	closed   bool
+
+	// 后台增量回收（仅 RetainVersions > 0 时启动）。
+	reclaimMu   sync.Mutex // 串行化回收轮次（手动 ReclaimLog 与后台循环互斥）
+	wakeReclaim chan struct{}
+	stopReclaim chan struct{}
+	reclaimWG   sync.WaitGroup
 
 	// 最近一次启动恢复的统计，供诊断/测试验证残尾截断。
 	recovery recoveryStats
@@ -37,6 +48,7 @@ func Open(dir string, opts Options) (*DB, error) {
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
+	opts = opts.normalize()
 
 	wlog, wstats, err := openWAL(dir, opts)
 	if err != nil {
@@ -60,6 +72,8 @@ func Open(dir string, opts Options) (*DB, error) {
 	if cp != nil {
 		db.store.restoreFromCheckpoint(cp.version, cp.state)
 		db.version = cp.version
+		// 检查点版本即重启后的历史边界：更早的提交记录已被回收。
+		db.historyFloor = cp.version
 	}
 	cpVer := db.version
 	for _, rec := range commits {
@@ -79,10 +93,19 @@ func Open(dir string, opts Options) (*DB, error) {
 	db.recovery.CheckpointFound = rstats.CheckpointFound
 	db.recovery.CheckpointVer = rstats.CheckpointVer
 
+	// 启用保留策略时启动后台增量回收循环，并立即尝试推进一次。
+	if opts.RetainVersions > 0 {
+		db.wakeReclaim = make(chan struct{}, 1)
+		db.stopReclaim = make(chan struct{})
+		db.reclaimWG.Add(1)
+		go db.reclaimLoop()
+		db.kickReclaim()
+	}
+
 	return db, nil
 }
 
-// Close 干净关闭：fsync 日志。不影响已落盘数据。
+// Close 干净关闭：先停后台回收，再 fsync 日志。不影响已落盘数据。
 func (db *DB) Close() error {
 	db.closedMu.Lock()
 	if db.closed {
@@ -91,6 +114,11 @@ func (db *DB) Close() error {
 	}
 	db.closed = true
 	db.closedMu.Unlock()
+	// 先唤醒并等后台回收退出，避免它还在写日志时关闭文件。
+	if db.stopReclaim != nil {
+		close(db.stopReclaim)
+		db.reclaimWG.Wait()
+	}
 	return db.wlog.close()
 }
 
@@ -145,6 +173,8 @@ func (db *DB) finishTxn(t *Txn) {
 	db.liveMu.Lock()
 	delete(db.liveTxns, t.id)
 	db.liveMu.Unlock()
+	// 读者/视图退出可能解除了对回收的钳制，唤醒后台继续推进。
+	db.kickReclaim()
 }
 
 // commitTxn 是提交的唯一入口，串行执行，保证冲突判定 + 落盘 + 发布的原子性顺序。
@@ -183,7 +213,7 @@ func (db *DB) commitTxn(t *Txn) error {
 	// 先落日志并 fsync，成功后才在内存发布版本。
 	// 这样“返回成功 == 崩溃后必可见”，且不存在内存有、日志无的窗口。
 	rec := commitRec{version: newVersion, writes: writes}
-	if err := db.wlog.appendPayload(encodeCommit(rec), db.opts.SyncOnCommit); err != nil {
+	if err := db.wlog.appendCommit(rec, db.opts.SyncOnCommit); err != nil {
 		// 落盘失败不发布版本，事务中止，调用方可重试。
 		db.finishTxn(t)
 		return fmt.Errorf("storage: commit failed before durability: %w", err)
@@ -191,6 +221,11 @@ func (db *DB) commitTxn(t *Txn) error {
 
 	db.store.applyAt(newVersion, writes)
 	db.version = newVersion
+	// 保留窗口被超出时唤醒后台回收（cheap check，仍持有 commitMu）。
+	if db.opts.RetainVersions > 0 && newVersion >= db.opts.RetainVersions &&
+		newVersion-db.opts.RetainVersions+1 > db.historyFloor {
+		db.kickReclaim()
+	}
 	db.finishTxn(t)
 	return nil
 }
@@ -234,10 +269,13 @@ func (db *DB) GarbageCollect(gc GCOptions) (GCResult, error) {
 		return GCResult{}, err
 	}
 
-	db.commitMu.RLock()
+	// 全程持有提交锁：检查点导出、写段、删旧段必须与并发提交互斥，
+	// 否则并发提交可能落进即将被删除的旧段，导致“已返回成功的提交”丢失。
+	db.commitMu.Lock()
+	defer db.commitMu.Unlock()
+
 	cpVersion := db.version
 	state := db.store.stateAt(cpVersion)
-	db.commitMu.RUnlock()
 
 	oldest := db.oldestActiveSnapshot()
 
@@ -260,6 +298,8 @@ func (db *DB) GarbageCollect(gc GCOptions) (GCResult, error) {
 	if err != nil {
 		return GCResult{CheckpointVer: cpVersion, CheckpointSegSeq: segSeq}, err
 	}
+	// 历史边界推进到检查点版本：更早的提交点不再可回看。
+	db.historyFloor = cpVersion
 	return GCResult{
 		CheckpointVer:    cpVersion,
 		CheckpointSegSeq: segSeq,

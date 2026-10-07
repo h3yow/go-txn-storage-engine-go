@@ -36,6 +36,15 @@ var (
 
 	// ErrNotFound 表示在事务快照中该键不存在（已删除或从未写入）。
 	ErrNotFound = errors.New("storage: key not found")
+
+	// ErrSnapshotExpired 表示请求的历史提交点已经落在保留范围之外：
+	// 该版本之前的历史已被回收（或从未存在），无法再从它开启历史视图。
+	// 它与 ErrNotFound（键不存在）、ErrTxnNotActive（事务失效）是不同类别。
+	ErrSnapshotExpired = errors.New("storage: requested commit point is older than the retained history and has been reclaimed")
+
+	// ErrSnapshotInFuture 表示请求的历史提交点比当前最新已提交版本还新，
+	// 该提交尚不存在（与“已被回收”方向相反）。
+	ErrSnapshotInFuture = errors.New("storage: requested commit point is newer than the latest committed version")
 )
 
 // ConflictError 携带写写冲突的细节，errors.Is(err, ErrWriteWriteConflict) 仍然成立。
@@ -82,6 +91,23 @@ func (e *GCBlockedError) Error() string {
 
 // Is 让 GCBlockedError 可被 errors.Is(..., ErrGCBlocked) 命中。
 func (e *GCBlockedError) Is(target error) bool { return target == ErrGCBlocked }
+
+// SnapshotError 携带历史视图开启失败的细节；
+// 具体类别由 Kind 指向 ErrSnapshotExpired / ErrSnapshotInFuture。
+type SnapshotError struct {
+	Kind    error  // ErrSnapshotExpired / ErrSnapshotInFuture
+	Want    uint64 // 请求的历史提交版本
+	Floor   uint64 // 当前可回看的最早提交版本（历史边界）
+	Current uint64 // 当前最新已提交版本
+}
+
+func (e *SnapshotError) Error() string {
+	return "storage: cannot open historical view at version " + uitoa(e.Want) +
+		" (retained from " + uitoa(e.Floor) + ", latest " + uitoa(e.Current) + ")"
+}
+
+// Is 让 SnapshotError 可被对应的哨兵错误命中。
+func (e *SnapshotError) Is(target error) bool { return e.Kind == target }
 
 func uitoa(u uint64) string {
 	if u == 0 {
